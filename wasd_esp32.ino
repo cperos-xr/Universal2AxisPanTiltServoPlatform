@@ -1,3 +1,22 @@
+// ------------------------------------------------------------
+// Realtime “keyboard nudge” servo controller (two servos)
+// ------------------------------------------------------------
+// PURPOSE:
+//   Control two servos interactively from a serial terminal by
+//   pressing keys (ideally without pressing Enter).
+//
+// WHAT IT DOES:
+//   - Maintains two signed command values v1 and v2 in degrees
+//     where 0 = centered, range is -90..+90.
+//   - Each keypress nudges v1/v2 by "step" degrees.
+//   - Converts v1/v2 into calibrated microsecond pulse widths,
+//     using each servo’s measured safe range.
+//
+// IMPORTANT:
+//   Arduino Serial Monitor is often *not* good for realtime keypresses.
+//   Use PuTTY / TeraTerm / CoolTerm if you want true "press keys" control.
+// ------------------------------------------------------------
+
 #include <Arduino.h>
 #include <ESP32Servo.h>
 
@@ -5,7 +24,14 @@ Servo s1, s2;
 #define SERVO1_PIN 3
 #define SERVO2_PIN 4
 
-// Calibrated safe ranges (microseconds)
+// ------------------------------------------------------------
+// Calibrated safe ranges (microseconds) measured earlier
+//   Servo 1 is full-range:  500..2400
+//   Servo 2 is narrower:    800..2050
+//
+// These are *hard limits* this program will never exceed.
+// ------------------------------------------------------------
+
 static const int S1_MIN_US = 500;
 static const int S1_MAX_US = 2400;
 static const int S2_MIN_US = 800;
