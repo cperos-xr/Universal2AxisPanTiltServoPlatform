@@ -1,30 +1,40 @@
 // ------------------------------------------------------------
-// Servo Controller + Queue + Sweep (ESP32-C3 + ESP32Servo)
-// Protocol: newline-delimited JSON ("JSONL") over Serial
+// PanTilt_JSON: 2-axis pan/tilt servo controller (ESP32-C3 tested)
+// Protocol: JSONL (one JSON object per line, newline-terminated)
+// No ArduinoJson dependency.
 //
-// REQUIRED: each command must be a JSON object containing "cmd"
-// Example: {"cmd":"help"}   (then press Enter / newline)
+// Features:
+// - set/adjust/center with dur or speed
+// - stop/stopAll/resetAll
+// - invert axis without jump
+// - queue: off|on|step + qAdd/qClear/qAbort/qStatus/qList (use {"cmd":"queue","mode":"step"} for macros)
+// - sweep macro (enqueues steps)
+// - position favorites: save/recall (1..5)
+// - command favorites (macros): favSave/favRun/favList/favClear (1..5), supports \\n multi-line scripts
+// - persistence: persist + factoryReset using Preferences (NVS wear-leveled), versioned + CRC
 //
-// Axes:
-//   X -> Servo 1
-//   Y -> Servo 2
-//
-// Positions are logical degrees [-90..+90] (0 = center).
-// Optional "id" is a command correlation id (for bots), NOT servo id.
-//
+// Notes:
+// - "id" is optional command correlation id (for bots), NOT servo id
+// - axis: x, y, xy
+// - degrees are logical -90..+90
 // ------------------------------------------------------------
 
 #include <Arduino.h>
 #include <ESP32Servo.h>
+#include <Preferences.h>
 
-// ------------------- Pins (set to your C3 board) -------------------
+// ------------------- Pins -------------------
+// Use the pins that you already validated on your board.
+// If 3/4 worked for you, keep them.
+#define SERVO1_PIN 3  // X (pan)
+#define SERVO2_PIN 4  // Y (tilt)
+
 Servo s1, s2;
-#define SERVO1_PIN 3  // X
-#define SERVO2_PIN 4  // Y
 
-// ------------------- Calibrated safe ranges (us) -------------------
+// ------------------- Calibrated safe ranges (microseconds) -------------------
 static const int S1_MIN_US = 500;
 static const int S1_MAX_US = 2400;
+
 static const int S2_MIN_US = 800;
 static const int S2_MAX_US = 2050;
 
@@ -32,47 +42,58 @@ static const int S2_MAX_US = 2050;
 static const float POS_MIN = -90.0f;
 static const float POS_MAX =  90.0f;
 
-// Avoid macro collision with system LINE_MAX:
-static const uint16_t CMD_LINE_MAX = 768;
+// Avoid macro collisions with libc headers:
+static const uint16_t CMD_LINE_MAX = 3600;
 
 // Queue sizing (fixed for predictability)
 static const uint8_t QMAX = 20;
 
-// Timeout guard for queued steps:
+// Timeout guard for queued steps
 static const uint32_t STEP_TIMEOUT_GRACE_MS = 2000;
 
-// ------------------- State -------------------
-static float v1 = 0.0f; // logical X degrees
-static float v2 = 0.0f; // logical Y degrees
+// Favorites
+static const int POS_FAV_SLOTS = 5;
+static const int CMD_FAV_SLOTS = 5;
+static const uint16_t FAV_SCRIPT_MAX = 3600; // max stored macro length per slot
+
+// ------------------- Runtime State -------------------
+static float v1 = 0.0f;  // X degrees (logical)
+static float v2 = 0.0f;  // Y degrees (logical)
 
 static bool invX = false;
 static bool invY = false;
 
-// Default speed used when dur is not specified (deg/sec)
+// default speed in deg/sec when dur not specified
 static float defaultSpeed = 90.0f;
 
-// Favorites 1..5
-static bool favValid[5] = {false,false,false,false,false};
-static float favX[5] = {0,0,0,0,0};
-static float favY[5] = {0,0,0,0,0};
+// Position favorites
+static bool posFavValid[POS_FAV_SLOTS] = {false,false,false,false,false};
+static float posFavX[POS_FAV_SLOTS] = {0,0,0,0,0};
+static float posFavY[POS_FAV_SLOTS] = {0,0,0,0,0};
 
-// Per-axis motion
+// Command favorites (macros/scripts)
+static bool cmdFavValid[CMD_FAV_SLOTS] = {false,false,false,false,false};
+static String cmdFavScript[CMD_FAV_SLOTS] = {"","","","",""};
+
+// Optional routing fields for master-script demux (echoed)
+static String lastSubsystem = "";
+static String lastRoute = "";
+
+// Dirty flag for persistence (only written when persist is called)
+static bool cfgDirty = false;
+
+// ------------------- Motion Profiles -------------------
 struct MoveProfile {
   bool active = false;
   float start = 0;
   float target = 0;
   uint32_t t0 = 0;
   uint32_t durMs = 0;
-  uint32_t cmdRef = 0;   // ref/id for done event
-  char axis = '?';       // 'x' or 'y'
+  uint32_t cmdRef = 0; // used for done events
+  char axis = '?';
 };
 
 static MoveProfile mx, my;
-
-// ------------------- Routing/Extensibility -------------------
-// Optional fields echoed back so a master script can demux responses.
-static String lastSubsystem = "";
-static String lastRoute = "";
 
 // ------------------- Queue -------------------
 enum QueueMode : uint8_t { Q_OFF=0, Q_ON=1, Q_STEP=2 };
@@ -80,20 +101,17 @@ static QueueMode qMode = Q_STEP;
 
 struct QueueItem {
   bool used = false;
+  uint32_t id = 0;
 
-  uint32_t id = 0;          // command id (or auto)
   String subsystem;
   String route;
-
-  // "set"/"adjust"/"center"/"recall"/"sweepTo"/etc.
-  String kind;
+  String kind;       // set/adjust/center/recall/sweep legs/etc.
 
   bool useX = false;
   bool useY = false;
 
   float tx = 0;
   float ty = 0;
-
   uint32_t dx = 0;
   uint32_t dy = 0;
 
@@ -105,15 +123,33 @@ static uint8_t qHead = 0;
 static uint8_t qTail = 0;
 static uint8_t qCount = 0;
 
-// Currently executing queued step (if any)
 static bool qActive = false;
 static QueueItem qCurrent;
 static bool qCurXDone = true;
 static bool qCurYDone = true;
 static uint32_t qStartedAt = 0;
 
-// Auto-IDs if id missing
 static uint32_t autoId = 0;
+
+// ------------------- Preferences / Persistence -------------------
+static Preferences prefs;
+static const char* PREF_NS = "pantilt";
+static const uint32_t CFG_MAGIC = 0x50544A31; // 'PTJ1'
+static const uint16_t CFG_VERSION = 1;
+
+struct PersistedConfig {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  float defaultSpeed;
+  uint8_t invX;
+  uint8_t invY;
+  uint8_t posValidMask; // 5 bits
+  uint8_t reserved2;
+  float posX[POS_FAV_SLOTS];
+  float posY[POS_FAV_SLOTS];
+  uint32_t crc32;
+};
 
 // ------------------- Utilities -------------------
 static float clampf(float x, float lo, float hi) { return (x<lo)?lo:((x>hi)?hi:x); }
@@ -148,10 +184,23 @@ static uint32_t durationFromSpeed(float start, float target, float speedDegPerSe
 }
 
 // Toggle invert with no physical jump:
-static void toggleInvertX() { invX = !invX; v1 = -v1; }
-static void toggleInvertY() { invY = !invY; v2 = -v2; }
+static void toggleInvertX() { invX = !invX; v1 = -v1; cfgDirty = true; }
+static void toggleInvertY() { invY = !invY; v2 = -v2; cfgDirty = true; }
 
-// ------------------- Minimal JSON helpers -------------------
+// ------------------- CRC32 (simple, deterministic) -------------------
+static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t len) {
+  crc = ~crc;
+  for (size_t i=0;i<len;i++) {
+    crc ^= data[i];
+    for (int b=0;b<8;b++) {
+      uint32_t mask = -(crc & 1u);
+      crc = (crc >> 1) ^ (0xEDB88320u & mask);
+    }
+  }
+  return ~crc;
+}
+
+// ------------------- Minimal JSON Helpers -------------------
 static bool findKey(const String& s, const char* key, int& keyPos) {
   String pat = "\""; pat += key; pat += "\"";
   keyPos = s.indexOf(pat);
@@ -161,14 +210,44 @@ static bool findKey(const String& s, const char* key, int& keyPos) {
 static bool getStringField(const String& s, const char* key, String& out) {
   int kp;
   if (!findKey(s, key, kp)) return false;
+
   int colon = s.indexOf(':', kp);
   if (colon < 0) return false;
-  int q1 = s.indexOf('\"', colon + 1);
+
+  int q1 = s.indexOf('"', colon + 1);
   if (q1 < 0) return false;
-  int q2 = s.indexOf('\"', q1 + 1);
-  if (q2 < 0) return false;
-  out = s.substring(q1 + 1, q2);
-  return true;
+
+  String tmp;
+  tmp.reserve(128);
+
+  bool esc = false;
+  for (int i = q1 + 1; i < (int)s.length(); i++) {
+    char c = s[i];
+
+    if (esc) {
+      // keep escaped char exactly once
+      tmp += c;
+      esc = false;
+      continue;
+    }
+
+    if (c == '\\') {
+      esc = true;
+      continue;
+    }
+
+    if (c == '"') {
+      out = tmp;
+      return true;
+    }
+
+    tmp += c;
+  }
+  return false;
+}
+
+static void flushOut() {
+  Serial.flush();
 }
 
 static bool getNumberField(const String& s, const char* key, float& out) {
@@ -176,8 +255,10 @@ static bool getNumberField(const String& s, const char* key, float& out) {
   if (!findKey(s, key, kp)) return false;
   int colon = s.indexOf(':', kp);
   if (colon < 0) return false;
+
   int i = colon + 1;
   while (i < (int)s.length() && (s[i] == ' ' || s[i] == '\t')) i++;
+
   int j = i;
   while (j < (int)s.length()) {
     char c = s[j];
@@ -210,7 +291,43 @@ static bool getBoolField(const String& s, const char* key, bool& out) {
   return false;
 }
 
-// ------------------- Reply helpers -------------------
+// Unescape only what we need for scripts: \\n \\r \\t \\\\ \\/ \\"
+static String unescapeScript(const String& in) {
+  String out; out.reserve(in.length());
+  for (int i=0;i<(int)in.length();i++) {
+    char c = in[i];
+
+    // Handle \n, \r, \t
+    if (c == '\\' && i+1 < (int)in.length()) {
+      char n = in[i+1];
+
+      // Normal escapes
+      if (n == 'n') { out += '\n'; i++; continue; }
+      if (n == 'r') { out += '\r'; i++; continue; }
+      if (n == 't') { out += '\t'; i++; continue; }
+
+      // If user sent \\n (double backslash form), treat it as newline too.
+      if (n == '\\' && i+2 < (int)in.length()) {
+        char n2 = in[i+2];
+        if (n2 == 'n') { out += '\n'; i += 2; continue; }
+        if (n2 == 'r') { out += '\r'; i += 2; continue; }
+        if (n2 == 't') { out += '\t'; i += 2; continue; }
+        if (n2 == '\\') { out += '\\'; i += 2; continue; }
+      }
+
+      // Other escapes we allow
+      if (n == '\\') { out += '\\'; i++; continue; }
+      if (n == '/')  { out += '/';  i++; continue; }
+      if (n == '\"') { out += '\"'; i++; continue; }
+    }
+
+    out += c;
+  }
+  return out;
+}
+
+
+// ------------------- Reply Helpers -------------------
 static void printRoutingFields(const String& subsystem, const String& route) {
   if (subsystem.length()) { Serial.print(",\"subsystem\":\""); Serial.print(subsystem); Serial.print("\""); }
   if (route.length())     { Serial.print(",\"route\":\"");     Serial.print(route);     Serial.print("\""); }
@@ -220,6 +337,7 @@ static void sendOk(uint32_t id, const String& subsystem, const String& route, co
   Serial.print("{\"ok\":true,\"id\":"); Serial.print(id);
   printRoutingFields(subsystem, route);
   Serial.print(",\"msg\":\""); Serial.print(msg); Serial.println("\"}");
+  flushOut();
 }
 
 static void sendErr(uint32_t id, const String& subsystem, const String& route, const char* code, const char* msg) {
@@ -227,6 +345,7 @@ static void sendErr(uint32_t id, const String& subsystem, const String& route, c
   printRoutingFields(subsystem, route);
   Serial.print(",\"error\":\""); Serial.print(code);
   Serial.print("\",\"msg\":\""); Serial.print(msg); Serial.println("\"}");
+  flushOut();
 }
 
 static void sendState(const char* eventName, uint32_t ref, const String& subsystem, const String& route) {
@@ -253,8 +372,18 @@ static void sendState(const char* eventName, uint32_t ref, const String& subsyst
   Serial.print(",\"active\":"); Serial.print(qActive ? "true":"false");
   Serial.print("}");
 
+  Serial.print(",\"cfgDirty\":"); Serial.print(cfgDirty ? "true":"false");
   Serial.print("}}");
   Serial.println("}");
+  flushOut();
+}
+
+static void sendEventDoneAxis(char axis, uint32_t ref, const String& subsystem, const String& route) {
+  Serial.print("{\"ok\":true,\"event\":\"done\",\"axis\":\""); Serial.print(axis);
+  Serial.print("\",\"ref\":"); Serial.print(ref);
+  printRoutingFields(subsystem, route);
+  Serial.println("}");
+  flushOut();
 }
 
 static void sendEventStarted(const QueueItem& it) {
@@ -273,19 +402,14 @@ static void sendEventStarted(const QueueItem& it) {
   Serial.print(",\"dy\":"); Serial.print(it.dy);
   Serial.print("}}");
   Serial.println("}");
-}
-
-static void sendEventDoneAxis(char axis, uint32_t ref, const String& subsystem, const String& route) {
-  Serial.print("{\"ok\":true,\"event\":\"done\",\"axis\":\""); Serial.print(axis);
-  Serial.print("\",\"ref\":"); Serial.print(ref);
-  printRoutingFields(subsystem, route);
-  Serial.println("}");
+  flushOut();
 }
 
 static void sendEventStepDone(const QueueItem& it) {
   Serial.print("{\"ok\":true,\"event\":\"stepDone\",\"ref\":"); Serial.print(it.id);
   printRoutingFields(it.subsystem, it.route);
   Serial.println("}");
+  flushOut();
 }
 
 static void sendEventFault(const String& subsystem, const String& route, const char* code, uint32_t ref, const char* msg) {
@@ -293,9 +417,10 @@ static void sendEventFault(const String& subsystem, const String& route, const c
   Serial.print("\",\"ref\":"); Serial.print(ref);
   printRoutingFields(subsystem, route);
   Serial.print(",\"msg\":\""); Serial.print(msg); Serial.println("\"}");
+  flushOut();
 }
 
-// ------------------- Queue operations -------------------
+// ------------------- Queue Ops -------------------
 static bool qIsFull() { return qCount >= QMAX; }
 static bool qIsEmpty() { return qCount == 0; }
 
@@ -317,7 +442,7 @@ static bool qDequeue(QueueItem& out) {
   return true;
 }
 
-static void qClear() {
+static void qClearAll() {
   for (uint8_t i=0;i<QMAX;i++) q[i].used = false;
   qHead = qTail = qCount = 0;
 }
@@ -328,12 +453,12 @@ static void stopAllMotion() { stopX(); stopY(); }
 
 static void abortQueueAndMotion() {
   stopAllMotion();
-  qClear();
+  qClearAll();
   qActive = false;
   qCurXDone = qCurYDone = true;
 }
 
-// Start a per-axis move (timed or instant)
+// ------------------- Motion Start -------------------
 static void startMoveX(float target, uint32_t durMs, uint32_t ref) {
   target = clampf(target, POS_MIN, POS_MAX);
   if (durMs == 0) { v1 = target; mx.active = false; mx.durMs = 0; return; }
@@ -358,7 +483,6 @@ static void startMoveY(float target, uint32_t durMs, uint32_t ref) {
   my.axis = 'y';
 }
 
-// Execute one atomic step immediately
 static void executeStep(const QueueItem& it) {
   stopAllMotion();
 
@@ -371,207 +495,12 @@ static void executeStep(const QueueItem& it) {
   applyOutputs();
 }
 
-// Start next queued item if idle
-static void maybeStartNextQueuedStep() {
-  if (qActive) return;
-  if (mx.active || my.active) return;
-  if (qIsEmpty()) return;
-
-  if (!qDequeue(qCurrent)) return;
-  qActive = true;
-  qStartedAt = millis();
-
-  uint32_t maxDur = 0;
-  if (qCurrent.useX && qCurrent.dx > maxDur) maxDur = qCurrent.dx;
-  if (qCurrent.useY && qCurrent.dy > maxDur) maxDur = qCurrent.dy;
-  qCurrent.expectedEnd = qStartedAt + maxDur + STEP_TIMEOUT_GRACE_MS;
-
-  sendEventStarted(qCurrent);
-  executeStep(qCurrent);
-
-  if (!mx.active && !my.active && qCurXDone && qCurYDone) {
-    sendEventStepDone(qCurrent);
-    qActive = false;
-  }
-}
-
-// ------------------- Help / Commands / Examples -------------------
-static void printCommands() {
-  Serial.println("Commands (JSON objects):");
-  Serial.println("  {\"cmd\":\"help\"}      -> full reference (descriptions + examples)");
-  Serial.println("  {\"cmd\":\"examples\"}  -> copy/paste examples");
-  Serial.println("  {\"cmd\":\"status\"}    -> current state");
-  Serial.println();
-  Serial.println("Actions:");
-  Serial.println("  set, adjust, center, stop, stopAll, resetAll, invert, speed, save, recall");
-  Serial.println("Queue:");
-  Serial.println("  queue, qAdd, qClear, qAbort, qStatus, qList");
-  Serial.println("Macro:");
-  Serial.println("  sweep");
-}
-
-static void printHelp() {
-  Serial.println("Protocol: JSONL (one JSON object per line). Required field: \"cmd\".");
-  Serial.println("Examples: {\"cmd\":\"help\"}  {\"cmd\":\"status\"}  {\"cmd\":\"speed\",\"value\":90}");
-  Serial.println("id is optional and is a command correlation id (for bots), not a servo id.");
-  Serial.println();
-  Serial.println("Fields:");
-  Serial.println("  axis: \"x\" | \"y\" | \"xy\"");
-  Serial.println("  value: degrees (for x/y) or deg/sec (for speed)");
-  Serial.println("  x,y: degrees when axis=\"xy\"");
-  Serial.println("  dur: seconds (float). If omitted, duration computed from speed.");
-  Serial.println("  speed: deg/sec override for that command");
-  Serial.println("  q: true|false queue hint (depends on queue mode)");
-  Serial.println("  subsystem/route: optional strings for master routing (echoed back)");
-  Serial.println();
-
-  Serial.println("COMMAND REFERENCE (each includes at least one example)");
-
-  Serial.println("\ncommands");
-  Serial.println("  Short list + quick-start hints.");
-  Serial.println("  Example: {\"cmd\":\"commands\"}");
-
-  Serial.println("\nhelp");
-  Serial.println("  Full reference.");
-  Serial.println("  Example: {\"cmd\":\"help\"}");
-
-  Serial.println("\nexamples");
-  Serial.println("  Prints ready-to-paste examples (no-id and with-id).");
-  Serial.println("  Example: {\"cmd\":\"examples\"}");
-
-  Serial.println("\nstatus");
-  Serial.println("  Returns x/y, invert flags, speed, motion, queue state.");
-  Serial.println("  Example: {\"cmd\":\"status\"}");
-
-  Serial.println("\nset");
-  Serial.println("  Set absolute target position(s) in degrees [-90..90].");
-  Serial.println("  Example (no id): {\"cmd\":\"set\",\"axis\":\"x\",\"value\":30,\"dur\":1.0}");
-  Serial.println("  Example (xy):    {\"id\":10,\"cmd\":\"set\",\"axis\":\"xy\",\"x\":10,\"y\":-20,\"speed\":90}");
-
-  Serial.println("\nadjust");
-  Serial.println("  Add delta(s) to current position(s).");
-  Serial.println("  Example (no id): {\"cmd\":\"adjust\",\"axis\":\"y\",\"value\":-5,\"speed\":120}");
-  Serial.println("  Example (xy):    {\"id\":11,\"cmd\":\"adjust\",\"axis\":\"xy\",\"x\":5,\"y\":-5,\"dur\":0.5}");
-
-  Serial.println("\ncenter");
-  Serial.println("  Move selected axis/axes to 0.");
-  Serial.println("  Example (no id): {\"cmd\":\"center\",\"axis\":\"xy\",\"dur\":1.0}");
-
-  Serial.println("\nstop");
-  Serial.println("  Stop motion on selected axis/axes immediately (hold current).");
-  Serial.println("  Example (no id): {\"cmd\":\"stop\",\"axis\":\"y\"}");
-
-  Serial.println("\nstopAll");
-  Serial.println("  Stop all motion. Defaults to flush queue (flush=true).");
-  Serial.println("  Example (no id): {\"cmd\":\"stopAll\"}");
-  Serial.println("  Example:         {\"id\":12,\"cmd\":\"stopAll\",\"flush\":false}");
-
-  Serial.println("\nresetAll");
-  Serial.println("  Stop + clear queue + center + clear invert + reset speed.");
-  Serial.println("  Example (no id): {\"cmd\":\"resetAll\"}");
-
-  Serial.println("\ninvert");
-  Serial.println("  Toggle inversion for axis/axes (no jump).");
-  Serial.println("  Example (no id): {\"cmd\":\"invert\",\"axis\":\"x\"}");
-
-  Serial.println("\nspeed");
-  Serial.println("  Set global default speed (deg/sec) used when dur is absent.");
-  Serial.println("  Example (no id): {\"cmd\":\"speed\",\"value\":90}");
-
-  Serial.println("\nsave");
-  Serial.println("  Save current x/y to favorite slot 1..5.");
-  Serial.println("  Example (no id): {\"cmd\":\"save\",\"slot\":1}");
-
-  Serial.println("\nrecall");
-  Serial.println("  Move to a saved slot 1..5. Optional axis/dur/speed.");
-  Serial.println("  Example (no id): {\"cmd\":\"recall\",\"slot\":1,\"dur\":1.5}");
-
-  Serial.println("\nqueue");
-  Serial.println("  Set queue mode: off|on|step.");
-  Serial.println("    off : execute immediately unless q:true");
-  Serial.println("    on  : enqueue by default unless q:false");
-  Serial.println("    step: enqueue only when q:true (default)");
-  Serial.println("  Example (no id): {\"cmd\":\"queue\",\"mode\":\"on\"}");
-
-  Serial.println("\nqAdd");
-  Serial.println("  Explicitly enqueue a motion command. Uses cmd2=set|adjust|center.");
-  Serial.println("  Example: {\"id\":20,\"cmd\":\"qAdd\",\"cmd2\":\"set\",\"axis\":\"x\",\"value\":-90,\"dur\":5}");
-
-  Serial.println("\nqClear");
-  Serial.println("  Clear pending queued steps (does not stop current motion).");
-  Serial.println("  Example (no id): {\"cmd\":\"qClear\"}");
-
-  Serial.println("\nqAbort");
-  Serial.println("  Stop all motion + clear queue (hard escape).");
-  Serial.println("  Example (no id): {\"cmd\":\"qAbort\"}");
-
-  Serial.println("\nqStatus");
-  Serial.println("  Returns queue mode/count/active.");
-  Serial.println("  Example (no id): {\"cmd\":\"qStatus\"}");
-
-  Serial.println("\nqList");
-  Serial.println("  Lists queued items (compact).");
-  Serial.println("  Example (no id): {\"cmd\":\"qList\"}");
-
-  Serial.println("\nsweep");
-  Serial.println("  Enqueue a sweep expanded into queued steps.");
-  Serial.println("  Fields: axis, from, to, dur, total(optional), loops(optional), dwell(optional), q(optional).");
-  Serial.println("  Example: {\"id\":30,\"cmd\":\"sweep\",\"axis\":\"x\",\"from\":-90,\"to\":90,\"dur\":55,\"loops\":1,\"dwell\":0.5,\"q\":true}");
-
-  Serial.println("\nRouting example (master-script friendly)");
-  Serial.println("  {\"id\":300,\"subsystem\":\"head\",\"route\":\"servo\",\"cmd\":\"set\",\"axis\":\"x\",\"value\":15,\"dur\":0.5}");
-}
-
-static void printExamples() {
-  Serial.println("Examples (NO id):");
-  Serial.println("{\"cmd\":\"commands\"}");
-  Serial.println("{\"cmd\":\"status\"}");
-  Serial.println("{\"cmd\":\"speed\",\"value\":90}");
-  Serial.println("{\"cmd\":\"set\",\"axis\":\"x\",\"value\":30,\"dur\":1.0}");
-  Serial.println("{\"cmd\":\"adjust\",\"axis\":\"y\",\"value\":-10,\"speed\":120}");
-  Serial.println("{\"cmd\":\"center\",\"axis\":\"xy\",\"dur\":1.0}");
-  Serial.println("{\"cmd\":\"invert\",\"axis\":\"y\"}");
-  Serial.println("{\"cmd\":\"save\",\"slot\":1}");
-  Serial.println("{\"cmd\":\"recall\",\"slot\":1,\"dur\":1.0}");
-  Serial.println("{\"cmd\":\"queue\",\"mode\":\"on\"}");
-  Serial.println("{\"cmd\":\"set\",\"axis\":\"x\",\"value\":-90,\"dur\":5}");
-  Serial.println("{\"cmd\":\"set\",\"axis\":\"x\",\"value\":90,\"dur\":50}");
-  Serial.println("{\"cmd\":\"qList\"}");
-  Serial.println("{\"cmd\":\"stopAll\"}");
-  Serial.println("{\"cmd\":\"resetAll\"}");
-  Serial.println();
-
-  Serial.println("Examples (WITH id):");
-  Serial.println("{\"id\":101,\"cmd\":\"commands\"}");
-  Serial.println("{\"id\":102,\"cmd\":\"status\"}");
-  Serial.println("{\"id\":103,\"cmd\":\"speed\",\"value\":90}");
-  Serial.println("{\"id\":104,\"cmd\":\"set\",\"axis\":\"xy\",\"x\":20,\"y\":-20,\"dur\":2.0}");
-  Serial.println("{\"id\":105,\"cmd\":\"adjust\",\"axis\":\"x\",\"value\":-10,\"speed\":90}");
-  Serial.println("{\"id\":106,\"cmd\":\"center\",\"axis\":\"xy\",\"dur\":1.0}");
-  Serial.println("{\"id\":107,\"cmd\":\"invert\",\"axis\":\"xy\"}");
-  Serial.println("{\"id\":108,\"cmd\":\"save\",\"slot\":2}");
-  Serial.println("{\"id\":109,\"cmd\":\"recall\",\"slot\":2,\"dur\":1.2}");
-  Serial.println("{\"id\":110,\"cmd\":\"queue\",\"mode\":\"step\"}");
-  Serial.println("{\"id\":111,\"cmd\":\"set\",\"axis\":\"x\",\"value\":-60,\"dur\":2.0,\"q\":true}");
-  Serial.println("{\"id\":112,\"cmd\":\"set\",\"axis\":\"x\",\"value\":60,\"dur\":2.0,\"q\":true}");
-  Serial.println("{\"id\":113,\"cmd\":\"qList\"}");
-  Serial.println("{\"id\":114,\"cmd\":\"qAbort\"}");
-  Serial.println();
-
-  Serial.println("Sweep:");
-  Serial.println("{\"id\":200,\"cmd\":\"sweep\",\"axis\":\"x\",\"from\":-60,\"to\":60,\"dur\":10,\"loops\":2,\"dwell\":0.2,\"q\":true}");
-  Serial.println();
-
-  Serial.println("Routing (master-script):");
-  Serial.println("{\"id\":300,\"subsystem\":\"head\",\"route\":\"servo\",\"cmd\":\"set\",\"axis\":\"x\",\"value\":15,\"dur\":0.5}");
-}
-
-// ------------------- Validation helpers -------------------
+// ------------------- Parsing Helpers -------------------
 static bool parseAxisMask(const String& axis, bool& useX, bool& useY) {
   String a = axis; a.toLowerCase();
-  if (a == "x") { useX = true; useY = false; return true; }
-  if (a == "y") { useX = false; useY = true; return true; }
-  if (a == "xy") { useX = true; useY = true; return true; }
+  if (a == "x")  { useX = true;  useY = false; return true; }
+  if (a == "y")  { useX = false; useY = true;  return true; }
+  if (a == "xy") { useX = true;  useY = true;  return true; }
   return false;
 }
 
@@ -596,13 +525,6 @@ static bool computeDurations(
   dx = useX ? durationFromSpeed(v1, tx, sp) : 0;
   dy = useY ? durationFromSpeed(v2, ty, sp) : 0;
   return true;
-}
-
-static bool shouldEnqueue(QueueMode mode, bool hasQ, bool qVal) {
-  if (mode == Q_ON)  return !(hasQ && qVal == false);
-  if (mode == Q_OFF) return (hasQ && qVal == true);
-  // Q_STEP
-  return (hasQ && qVal == true);
 }
 
 static QueueItem buildStepFromCommand(
@@ -684,7 +606,448 @@ static QueueItem buildStepFromCommand(
   return it;
 }
 
-// ------------------- Motion update + queue scheduler -------------------
+// ------------------- Command Lists / Help / Examples -------------------
+static void printCommands() {
+  Serial.println("Commands (JSON objects, newline-terminated):");
+  Serial.println("  {\"cmd\":\"commands\"}  -> short list");
+  Serial.println("  {\"cmd\":\"help\"}      -> full reference");
+  Serial.println("  {\"cmd\":\"examples\"}  -> copy/paste examples");
+  Serial.println("  {\"cmd\":\"status\"}    -> state dump");
+  Serial.println();
+  Serial.println("Info: commands, help, examples, status");
+  Serial.println("Motion: set, adjust, center, stop, stopAll, resetAll, invert, speed");
+  Serial.println("Position favs: save, recall");
+  Serial.println("Command favs: favSave, favRun, favList, favClear");
+  Serial.println("Queue: queue, qAdd, qClear, qAbort, qStatus, qList");
+  Serial.println("Macro: sweep");
+  Serial.println("Persistence: persist, factoryReset");
+}
+
+static void printHelp() {
+  Serial.println("Protocol: JSONL (one JSON object per line). Required field: \"cmd\".");
+  Serial.println("Serial: 115200 baud. Line ending must be Newline or Both NL/CR.");
+  Serial.println();
+  Serial.println("Key fields:");
+  Serial.println("  axis: \"x\" | \"y\" | \"xy\"");
+  Serial.println("  value: degrees for set/adjust, or deg/sec for speed");
+  Serial.println("  x,y: degrees when axis=\"xy\"");
+  Serial.println("  dur: seconds (float). If present, overrides speed");
+  Serial.println("  speed: deg/sec override for a motion command");
+  Serial.println("  q: true|false queue hint (depends on queue mode)");
+  Serial.println("  id: optional correlation id (bots). Not a servo id.");
+  Serial.println();
+  Serial.println("Ranges:");
+  Serial.println("  position degrees: -90 .. +90 (clamped)");
+  Serial.println("  speed deg/sec:    0.1 .. 1000 (recommended typical 60..180)");
+  Serial.println("  dur seconds:      0 .. 3600");
+  Serial.println();
+
+  Serial.println("COMMAND REFERENCE (description + at least 1 example each)");
+
+  Serial.println("\ncommands");
+  Serial.println("  Short list of commands.");
+  Serial.println("  Example: {\"cmd\":\"commands\"}");
+
+  Serial.println("\nhelp");
+  Serial.println("  Full command reference.");
+  Serial.println("  Example: {\"cmd\":\"help\"}");
+
+  Serial.println("\nexamples");
+  Serial.println("  Prints copy/paste examples.");
+  Serial.println("  Example: {\"cmd\":\"examples\"}");
+
+  Serial.println("\nstatus");
+  Serial.println("  Returns current state (x/y, invert, speed, queue state, dirty flag).");
+  Serial.println("  Example: {\"cmd\":\"status\"}");
+
+  Serial.println("\nspeed");
+  Serial.println("  Set global default speed (deg/sec) used when dur is absent.");
+  Serial.println("  Example: {\"cmd\":\"speed\",\"value\":90}");
+
+  Serial.println("\nset");
+  Serial.println("  Set absolute target position(s) in degrees.");
+  Serial.println("  Example (no id): {\"cmd\":\"set\",\"axis\":\"x\",\"value\":30,\"dur\":1.0}");
+  Serial.println("  Example (xy):    {\"id\":10,\"cmd\":\"set\",\"axis\":\"xy\",\"x\":10,\"y\":-20,\"speed\":120}");
+
+  Serial.println("\nadjust");
+  Serial.println("  Add delta(s) to current position(s) in degrees.");
+  Serial.println("  Example: {\"cmd\":\"adjust\",\"axis\":\"y\",\"value\":-5,\"speed\":120}");
+
+  Serial.println("\ncenter");
+  Serial.println("  Move selected axis/axes to 0.");
+  Serial.println("  Example: {\"cmd\":\"center\",\"axis\":\"xy\",\"dur\":1.0}");
+
+  Serial.println("\nstop");
+  Serial.println("  Stop selected axis/axes immediately (hold current).");
+  Serial.println("  Example: {\"cmd\":\"stop\",\"axis\":\"y\"}");
+
+  Serial.println("\nstopAll");
+  Serial.println("  Stop all motion. Defaults to flush queue (flush=true).");
+  Serial.println("  Example: {\"cmd\":\"stopAll\"}");
+  Serial.println("  Example: {\"cmd\":\"stopAll\",\"flush\":false}");
+
+  Serial.println("\nresetAll");
+  Serial.println("  Stop + clear queue + center x/y. Does not erase saved config.");
+  Serial.println("  Example: {\"cmd\":\"resetAll\"}");
+
+  Serial.println("\ninvert");
+  Serial.println("  Toggle inversion for axis/axes without mechanical jump.");
+  Serial.println("  Example: {\"cmd\":\"invert\",\"axis\":\"x\"}");
+
+  Serial.println("\nsave");
+  Serial.println("  Save current x/y position into slot 1..5 (position favorites).");
+  Serial.println("  Example: {\"cmd\":\"save\",\"slot\":1}");
+
+  Serial.println("\nrecall");
+  Serial.println("  Move to saved position slot 1..5.");
+  Serial.println("  Example: {\"cmd\":\"recall\",\"slot\":1,\"dur\":1.2}");
+
+  Serial.println("\nfavSave");
+  Serial.println("  Save a command favorite (macro script) into slot 1..5.");
+  Serial.println("  Use \"line\" for a single command or \"script\" for multi-line.");
+  Serial.println("  Multi-line is encoded with \\\\n inside the JSON string.");
+  Serial.println("  Example (single): {\"cmd\":\"favSave\",\"slot\":1,\"line\":\"{\\\"cmd\\\":\\\"center\\\",\\\"axis\\\":\\\"xy\\\",\\\"dur\\\":1.0}\"}");
+  Serial.println("  Example (multi):  {\"cmd\":\"favSave\",\"slot\":2,\"script\":\"{\\\"cmd\\\":\\\"queue\\\",\\\"mode\\\":\\\"on\\\"}\\\\n{\\\"cmd\\\":\\\"set\\\",\\\"axis\\\":\\\"x\\\",\\\"value\\\":-60,\\\"dur\\\":2}\\\\n{\\\"cmd\\\":\\\"set\\\",\\\"axis\\\":\\\"x\\\",\\\"value\\\":60,\\\"dur\\\":2}\"}");
+
+  Serial.println("\nfavRun");
+  Serial.println("  Run the saved favorite script in slot 1..5.");
+  Serial.println("  Temporarily sets queue mode to 'on' so motion commands enqueue.");
+  Serial.println("  After all lines execute, queue mode is restored.");
+  Serial.println("  The queued motions then execute in sequence.");
+  Serial.println("  Example: {\"cmd\":\"favRun\",\"slot\":2}");
+  Serial.println("  Tip: Include {\"cmd\":\"stopAll\"} at end of script to auto-stop when done.");
+
+  Serial.println("\nfavList");
+  Serial.println("  List favorite slots and a short preview.");
+  Serial.println("  Example: {\"cmd\":\"favList\"}");
+
+  Serial.println("\nfavClear");
+  Serial.println("  Clear a favorite slot, or all slots with slot=0.");
+  Serial.println("  Example: {\"cmd\":\"favClear\",\"slot\":2}");
+  Serial.println("  Example: {\"cmd\":\"favClear\",\"slot\":0}");
+
+  Serial.println("\nqueue");
+  Serial.println("  Set queue mode: off|on|step.");
+  Serial.println("    off : execute immediately unless q:true");
+  Serial.println("    on  : enqueue by default unless q:false");
+  Serial.println("    step: enqueue only when q:true (default)");
+  Serial.println("  Example: {\"cmd\":\"queue\",\"mode\":\"on\"}");
+
+  Serial.println("\nqAdd");
+  Serial.println("  Explicitly enqueue a motion command. Uses cmd2=set|adjust|center.");
+  Serial.println("  Example: {\"cmd\":\"qAdd\",\"cmd2\":\"set\",\"axis\":\"x\",\"value\":-90,\"dur\":5}");
+
+  Serial.println("\nqClear");
+  Serial.println("  Clear queued steps (does not stop current motion).");
+  Serial.println("  Example: {\"cmd\":\"qClear\"}");
+
+  Serial.println("\nqAbort");
+  Serial.println("  Stop all motion + clear queue (hard escape).");
+  Serial.println("  Example: {\"cmd\":\"qAbort\"}");
+
+  Serial.println("\nqStatus");
+  Serial.println("  Return queue mode/count/active.");
+  Serial.println("  Example: {\"cmd\":\"qStatus\"}");
+
+  Serial.println("\nqList");
+  Serial.println("  List queued items (compact).");
+  Serial.println("  Example: {\"cmd\":\"qList\"}");
+
+  Serial.println("\nsweep");
+  Serial.println("  Enqueue a sweep macro expanded into queue steps.");
+  Serial.println("  Fields: axis, from, to, dur, loops(optional), dwell(optional), q(optional).");
+  Serial.println("  Example: {\"cmd\":\"sweep\",\"axis\":\"x\",\"from\":-80,\"to\":80,\"dur\":6,\"loops\":2,\"dwell\":0.2,\"q\":true}");
+
+  Serial.println("\npersist");
+  Serial.println("  Write config to flash (NVS wear-leveled). Only writes if changed.");
+  Serial.println("  Saves: speed, invert flags, position favorites, command favorites.");
+  Serial.println("  Example: {\"cmd\":\"persist\"}");
+
+  Serial.println("\nfactoryReset");
+  Serial.println("  Erase saved config in flash and restore defaults.");
+  Serial.println("  Example: {\"cmd\":\"factoryReset\"}");
+}
+
+static void printExamples() {
+  Serial.println("Examples (NO id):");
+  Serial.println("{\"cmd\":\"commands\"}");
+  Serial.println("{\"cmd\":\"status\"}");
+  Serial.println("{\"cmd\":\"speed\",\"value\":120}");
+  Serial.println("{\"cmd\":\"center\",\"axis\":\"xy\",\"dur\":1.0}");
+  Serial.println("{\"cmd\":\"set\",\"axis\":\"x\",\"value\":45,\"dur\":0.7}");
+  Serial.println("{\"cmd\":\"adjust\",\"axis\":\"y\",\"value\":-10,\"speed\":120}");
+  Serial.println("{\"cmd\":\"invert\",\"axis\":\"x\"}");
+  Serial.println("{\"cmd\":\"save\",\"slot\":1}");
+  Serial.println("{\"cmd\":\"recall\",\"slot\":1,\"dur\":1.2}");
+  Serial.println();
+
+  Serial.println("Queue sequences:");
+  Serial.println("{\"cmd\":\"queue\",\"mode\":\"on\"}");
+  Serial.println("{\"cmd\":\"set\",\"axis\":\"x\",\"value\":-60,\"dur\":1.5}");
+  Serial.println("{\"cmd\":\"set\",\"axis\":\"x\",\"value\":60,\"dur\":1.5}");
+  Serial.println("{\"cmd\":\"set\",\"axis\":\"xy\",\"x\":0,\"y\":-20,\"dur\":1.0}");
+  Serial.println("{\"cmd\":\"stopAll\"}");
+  Serial.println();
+
+  Serial.println("Sweep:");
+  Serial.println("{\"cmd\":\"queue\",\"mode\":\"step\"}");
+  Serial.println("{\"cmd\":\"sweep\",\"axis\":\"x\",\"from\":-80,\"to\":80,\"dur\":6,\"loops\":2,\"dwell\":0.2,\"q\":true}");
+  Serial.println();
+
+  Serial.println("Command favorites (macros):");
+  Serial.println("{\"cmd\":\"favSave\",\"slot\":1,\"line\":\"{\\\"cmd\\\":\\\"center\\\",\\\"axis\\\":\\\"xy\\\",\\\"dur\\\":1.0}\"}");
+  Serial.println("{\"cmd\":\"favSave\",\"slot\":2,\"script\":\"{\\\"cmd\\\":\\\"queue\\\",\\\"mode\\\":\\\"on\\\"}\\\\n{\\\"cmd\\\":\\\"set\\\",\\\"axis\\\":\\\"x\\\",\\\"value\\\":-60,\\\"dur\\\":1.5}\\\\n{\\\"cmd\\\":\\\"set\\\",\\\"axis\\\":\\\"x\\\",\\\"value\\\":60,\\\"dur\\\":1.5}\\\\n{\\\"cmd\\\":\\\"stopAll\\\"}\"}");
+  Serial.println("{\"cmd\":\"favRun\",\"slot\":2}");
+  Serial.println("{\"cmd\":\"favList\"}");
+  Serial.println("{\"cmd\":\"favClear\",\"slot\":2}");
+  Serial.println();
+
+  Serial.println("Persistence:");
+  Serial.println("{\"cmd\":\"persist\"}");
+  Serial.println("{\"cmd\":\"factoryReset\"}");
+}
+
+// ------------------- Persistence Implementation -------------------
+static void applyDefaults() {
+  defaultSpeed = 90.0f;
+  invX = false;
+  invY = false;
+
+  for (int i=0;i<POS_FAV_SLOTS;i++) {
+    posFavValid[i] = false;
+    posFavX[i] = 0;
+    posFavY[i] = 0;
+  }
+  for (int i=0;i<CMD_FAV_SLOTS;i++) {
+    cmdFavValid[i] = false;
+    cmdFavScript[i] = "";
+  }
+  cfgDirty = false;
+}
+
+static PersistedConfig makePersistedConfig() {
+  PersistedConfig cfg{};
+  cfg.magic = CFG_MAGIC;
+  cfg.version = CFG_VERSION;
+  cfg.defaultSpeed = defaultSpeed;
+  cfg.invX = invX ? 1 : 0;
+  cfg.invY = invY ? 1 : 0;
+
+  uint8_t mask = 0;
+  for (int i=0;i<POS_FAV_SLOTS;i++) {
+    if (posFavValid[i]) mask |= (1u << i);
+    cfg.posX[i] = posFavX[i];
+    cfg.posY[i] = posFavY[i];
+  }
+  cfg.posValidMask = mask;
+
+  cfg.crc32 = 0;
+  uint32_t crc = crc32_update(0, (const uint8_t*)&cfg, sizeof(PersistedConfig));
+  cfg.crc32 = crc;
+  return cfg;
+}
+
+static bool loadConfigFromFlash() {
+  prefs.begin(PREF_NS, true);
+
+  PersistedConfig cfg{};
+  size_t n = prefs.getBytes("cfg", &cfg, sizeof(cfg));
+  if (n != sizeof(cfg) || cfg.magic != CFG_MAGIC || cfg.version != CFG_VERSION) {
+    prefs.end();
+    return false;
+  }
+
+  uint32_t storedCrc = cfg.crc32;
+  cfg.crc32 = 0;
+  uint32_t calcCrc = crc32_update(0, (const uint8_t*)&cfg, sizeof(PersistedConfig));
+
+  if (calcCrc != storedCrc) {
+    prefs.end();
+    return false;
+  }
+
+  defaultSpeed = cfg.defaultSpeed;
+  if (defaultSpeed < 0.1f || defaultSpeed > 1000.0f) defaultSpeed = 90.0f;
+
+  invX = (cfg.invX != 0);
+  invY = (cfg.invY != 0);
+
+  for (int i=0;i<POS_FAV_SLOTS;i++) {
+    bool valid = (cfg.posValidMask & (1u << i)) != 0;
+    posFavValid[i] = valid;
+    posFavX[i] = clampf(cfg.posX[i], POS_MIN, POS_MAX);
+    posFavY[i] = clampf(cfg.posY[i], POS_MIN, POS_MAX);
+  }
+
+  // Load command favorites (stored as strings)
+  for (int i=0;i<CMD_FAV_SLOTS;i++) {
+    String key = "fav";
+    key += (i+1);
+    String s = prefs.getString(key.c_str(), "");
+    if (s.length() > 0) {
+      cmdFavValid[i] = true;
+      if (s.length() > FAV_SCRIPT_MAX) s = s.substring(0, FAV_SCRIPT_MAX);
+      cmdFavScript[i] = s;
+    } else {
+      cmdFavValid[i] = false;
+      cmdFavScript[i] = "";
+    }
+  }
+
+  prefs.end();
+  cfgDirty = false;
+  return true;
+}
+
+static bool persistToFlash(String& why) {
+  if (!cfgDirty) {
+    why = "no_changes";
+    return true;
+  }
+
+  PersistedConfig cfg = makePersistedConfig();
+
+  prefs.begin(PREF_NS, false);
+
+  bool ok = true;
+  ok &= (prefs.putBytes("cfg", &cfg, sizeof(cfg)) == sizeof(cfg));
+
+  // Save command favorites (strings)
+  for (int i=0;i<CMD_FAV_SLOTS;i++) {
+    String key = "fav";
+    key += (i+1);
+    if (cmdFavValid[i] && cmdFavScript[i].length() > 0) {
+      String s = cmdFavScript[i];
+      if (s.length() > FAV_SCRIPT_MAX) s = s.substring(0, FAV_SCRIPT_MAX);
+      ok &= prefs.putString(key.c_str(), s) > 0;
+    } else {
+      prefs.remove(key.c_str());
+    }
+  }
+
+  prefs.end();
+
+  if (ok) {
+    cfgDirty = false;
+    why = "persisted";
+    return true;
+  }
+
+  why = "write_failed";
+  return false;
+}
+
+static bool factoryResetFlash(String& why) {
+  prefs.begin(PREF_NS, false);
+  bool ok = prefs.clear();
+  prefs.end();
+
+  applyDefaults();
+  why = ok ? "factory_reset" : "clear_failed";
+  return ok;
+}
+
+// ------------------- Macro Runner -------------------
+// Guard to prevent runaway recursion
+static bool macroRunning = false;
+
+// Saved queue mode before macro started (restore after)
+static QueueMode qModeSavedForMacro = Q_STEP;
+
+static bool shouldEnqueue(QueueMode mode, bool hasQ, bool qVal) {
+  // During macro execution: motion commands enqueue unless explicitly q:false
+  if (macroRunning) {
+    // If user explicitly says q:false, execute immediately
+    if (hasQ && !qVal) return false;
+    // Otherwise enqueue so macro can batch motions
+    return true;
+  }
+
+  if (mode == Q_ON)  return !(hasQ && qVal == false);
+  if (mode == Q_OFF) return (hasQ && qVal == true);
+  return (hasQ && qVal == true); // Q_STEP
+}
+
+// Reject saving dangerous commands into favorites
+static bool looksDangerousFavorite(const String& line) {
+  // minimal checks: disallow persist, factoryReset, favRun
+  String t = line;
+  t.toLowerCase();
+  if (t.indexOf("\"cmd\":\"persist\"") >= 0) return true;
+  if (t.indexOf("\"cmd\":\"factoryreset\"") >= 0) return true;
+  if (t.indexOf("\"cmd\":\"favrun\"") >= 0) return true;
+  return false;
+}
+
+// Forward declare handler
+static void handleCommandLine(String line);
+
+static bool runFavoriteScript(uint32_t id, const String& subsystem, const String& route, const String& scriptRaw) {
+  if (macroRunning) {
+    sendErr(id, subsystem, route, "macro_busy", "A macro is already running");
+    return false;
+  }
+
+  // Save current queue mode and switch to "on" so motion commands enqueue
+  qModeSavedForMacro = qMode;
+  qMode = Q_ON;
+  macroRunning = true;
+
+  String script = scriptRaw; // already unescaped when saved
+  // Execute each non-empty line
+  int start = 0;
+  int steps = 0;
+  while (start < (int)script.length()) {
+    int end = script.indexOf('\n', start);
+    if (end < 0) end = script.length();
+    String line = script.substring(start, end);
+    line.trim();
+    start = end + 1;
+
+    if (!line.length()) continue;
+    steps++;
+    if (steps > 50) {
+      sendErr(id, subsystem, route, "macro_too_long", "Macro step limit exceeded (50)");
+      macroRunning = false;
+      qMode = qModeSavedForMacro;
+      return false;
+    }
+
+    // Execute the line (motion commands will enqueue)
+    handleCommandLine(line);
+    Serial.flush();
+  }
+
+  macroRunning = false;
+  // Restore original queue mode
+  qMode = qModeSavedForMacro;
+  return true;
+}
+
+// ------------------- Scheduler -------------------
+static void maybeStartNextQueuedStep() {
+  if (qActive) return;
+  if (mx.active || my.active) return;
+  if (qIsEmpty()) return;
+
+  if (!qDequeue(qCurrent)) return;
+  qActive = true;
+  qStartedAt = millis();
+
+  uint32_t maxDur = 0;
+  if (qCurrent.useX && qCurrent.dx > maxDur) maxDur = qCurrent.dx;
+  if (qCurrent.useY && qCurrent.dy > maxDur) maxDur = qCurrent.dy;
+  qCurrent.expectedEnd = qStartedAt + maxDur + STEP_TIMEOUT_GRACE_MS;
+
+  sendEventStarted(qCurrent);
+  executeStep(qCurrent);
+
+  if (!mx.active && !my.active && qCurXDone && qCurYDone) {
+    sendEventStepDone(qCurrent);
+    qActive = false;
+  }
+}
+
 static void updateMotion() {
   const uint32_t now = millis();
 
@@ -736,7 +1099,7 @@ static void updateMotion() {
   maybeStartNextQueuedStep();
 }
 
-// ------------------- Command handling -------------------
+// ------------------- Command Handler -------------------
 static void handleCommandLine(String line) {
   line.trim();
   if (!line.length()) return;
@@ -762,13 +1125,35 @@ static void handleCommandLine(String line) {
   bool qVal=false, hasQ=false;
   if (getBoolField(line, "q", qVal)) hasQ = true;
 
-  // ---- info ----
+  // ---- informational ----
   if (cmd == "commands") { sendOk(id, subsystem, route, "commands"); printCommands(); return; }
   if (cmd == "help")     { sendOk(id, subsystem, route, "help");     printHelp();     return; }
   if (cmd == "examples") { sendOk(id, subsystem, route, "examples"); printExamples(); return; }
   if (cmd == "status")   { sendOk(id, subsystem, route, "status");   sendState(nullptr, 0, subsystem, route); return; }
 
-  // ---- queue ----
+  // ---- persistence ----
+  if (cmd == "persist") {
+    String why;
+    bool ok = persistToFlash(why);
+    if (!ok) { sendErr(id, subsystem, route, "persist_failed", why.c_str()); return; }
+    sendOk(id, subsystem, route, why.c_str());
+    sendState("done", id, subsystem, route);
+    return;
+  }
+
+  if (cmd == "factoryreset") {
+    String why;
+    bool ok = factoryResetFlash(why);
+    if (!ok) { sendErr(id, subsystem, route, "factory_reset_failed", why.c_str()); return; }
+    v1 = 0; v2 = 0;
+    abortQueueAndMotion();
+    applyOutputs();
+    sendOk(id, subsystem, route, why.c_str());
+    sendState("done", id, subsystem, route);
+    return;
+  }
+
+  // ---- queue mode ----
   if (cmd == "queue") {
     String mode;
     if (!getStringField(line, "mode", mode)) { sendErr(id, subsystem, route, "missing_mode", "queue requires mode: off|on|step"); return; }
@@ -782,7 +1167,7 @@ static void handleCommandLine(String line) {
     return;
   }
 
-  if (cmd == "qclear") { qClear(); sendOk(id, subsystem, route, "queue_cleared"); sendState("done", id, subsystem, route); return; }
+  if (cmd == "qclear") { qClearAll(); sendOk(id, subsystem, route, "queue_cleared"); sendState("done", id, subsystem, route); return; }
 
   if (cmd == "qabort") {
     abortQueueAndMotion();
@@ -840,7 +1225,7 @@ static void handleCommandLine(String line) {
     return;
   }
 
-  // ---- stop/reset/invert/speed/favorites ----
+  // ---- motion control ----
   if (cmd == "stop") {
     String axis="xy"; (void)getStringField(line, "axis", axis);
     bool useX=false,useY=false;
@@ -857,7 +1242,7 @@ static void handleCommandLine(String line) {
     bool flush = true;
     (void)getBoolField(line, "flush", flush);
     stopAllMotion();
-    if (flush) { qClear(); qActive = false; }
+    if (flush) { qClearAll(); qActive = false; }
     applyOutputs();
     sendOk(id, subsystem, route, flush ? "stopped_all_flushed" : "stopped_all");
     sendState("done", id, subsystem, route);
@@ -867,10 +1252,8 @@ static void handleCommandLine(String line) {
   if (cmd == "resetall") {
     abortQueueAndMotion();
     v1 = 0; v2 = 0;
-    invX = false; invY = false;
-    defaultSpeed = 90.0f;
     applyOutputs();
-    sendOk(id, subsystem, route, "reset_all");
+    sendOk(id, subsystem, route, "reset_all_runtime");
     sendState("done", id, subsystem, route);
     return;
   }
@@ -890,37 +1273,40 @@ static void handleCommandLine(String line) {
   if (cmd == "speed") {
     float sp;
     if (!getNumberField(line, "value", sp)) { sendErr(id, subsystem, route, "missing_value", "speed requires value (deg/sec)"); return; }
-    if (sp < 0.1f || sp > 1000.0f) { sendErr(id, subsystem, route, "bad_value", "speed value out of range"); return; }
+    if (sp < 0.1f || sp > 1000.0f) { sendErr(id, subsystem, route, "bad_value", "speed out of range"); return; }
     defaultSpeed = sp;
+    cfgDirty = true;
     sendOk(id, subsystem, route, "speed_set");
     sendState("done", id, subsystem, route);
     return;
   }
 
+  // ---- position favorites ----
   if (cmd == "save") {
     int slot=0;
-    if (!getIntField(line, "slot", slot) || slot < 1 || slot > 5) { sendErr(id, subsystem, route, "bad_slot", "save requires slot 1..5"); return; }
+    if (!getIntField(line, "slot", slot) || slot < 1 || slot > POS_FAV_SLOTS) { sendErr(id, subsystem, route, "bad_slot", "save requires slot 1..5"); return; }
     int idx = slot - 1;
-    favValid[idx] = true;
-    favX[idx] = v1;
-    favY[idx] = v2;
-    sendOk(id, subsystem, route, "saved");
+    posFavValid[idx] = true;
+    posFavX[idx] = v1;
+    posFavY[idx] = v2;
+    cfgDirty = true;
+    sendOk(id, subsystem, route, "saved_position");
     sendState("done", id, subsystem, route);
     return;
   }
 
   if (cmd == "recall") {
     int slot=0;
-    if (!getIntField(line, "slot", slot) || slot < 1 || slot > 5) { sendErr(id, subsystem, route, "bad_slot", "recall requires slot 1..5"); return; }
+    if (!getIntField(line, "slot", slot) || slot < 1 || slot > POS_FAV_SLOTS) { sendErr(id, subsystem, route, "bad_slot", "recall requires slot 1..5"); return; }
     int idx = slot - 1;
-    if (!favValid[idx]) { sendErr(id, subsystem, route, "empty_slot", "slot not saved yet"); return; }
+    if (!posFavValid[idx]) { sendErr(id, subsystem, route, "empty_slot", "slot not saved yet"); return; }
 
     String axis="xy"; (void)getStringField(line, "axis", axis);
     bool useX=false,useY=false;
     if (!parseAxisMask(axis, useX, useY)) { sendErr(id, subsystem, route, "bad_axis", "axis must be x, y, or xy"); return; }
 
-    float tx = favX[idx];
-    float ty = favY[idx];
+    float tx = posFavX[idx];
+    float ty = posFavY[idx];
 
     float durSec=-1, sp=-1;
     bool hasDur = getNumberField(line, "dur", durSec);
@@ -946,6 +1332,108 @@ static void handleCommandLine(String line) {
     return;
   }
 
+  // ---- command favorites ----
+  if (cmd == "favlist") {
+    Serial.print("{\"ok\":true,\"id\":"); Serial.print(id);
+    printRoutingFields(subsystem, route);
+    Serial.print(",\"favorites\":[");
+    for (int i=0;i<CMD_FAV_SLOTS;i++) {
+      if (i) Serial.print(",");
+      Serial.print("{\"slot\":"); Serial.print(i+1);
+      Serial.print(",\"valid\":"); Serial.print(cmdFavValid[i] ? "true":"false");
+      if (cmdFavValid[i]) {
+        String preview = cmdFavScript[i];
+        preview.replace("\n", "\\n");
+        if (preview.length() > 120) preview = preview.substring(0, 120) + "...";
+        Serial.print(",\"preview\":\""); Serial.print(preview); Serial.print("\"");
+      }
+      Serial.print("}");
+    }
+    Serial.println("]}");
+    return;
+  }
+
+  if (cmd == "favclear") {
+    int slot=0;
+    if (!getIntField(line, "slot", slot) || slot < 0 || slot > CMD_FAV_SLOTS) {
+      sendErr(id, subsystem, route, "bad_slot", "favClear requires slot 0..5 (0 clears all)");
+      return;
+    }
+    if (slot == 0) {
+      for (int i=0;i<CMD_FAV_SLOTS;i++) { cmdFavValid[i]=false; cmdFavScript[i]=""; }
+      cfgDirty = true;
+      sendOk(id, subsystem, route, "fav_cleared_all");
+      sendState("done", id, subsystem, route);
+      return;
+    }
+    int idx = slot - 1;
+    cmdFavValid[idx] = false;
+    cmdFavScript[idx] = "";
+    cfgDirty = true;
+    sendOk(id, subsystem, route, "fav_cleared");
+    sendState("done", id, subsystem, route);
+    return;
+  }
+
+  if (cmd == "favsave") {
+    int slot=0;
+    if (!getIntField(line, "slot", slot) || slot < 1 || slot > CMD_FAV_SLOTS) { sendErr(id, subsystem, route, "bad_slot", "favSave requires slot 1..5"); return; }
+    int idx = slot - 1;
+
+    String raw;
+    bool hasLine = getStringField(line, "line", raw);
+    bool hasScript = getStringField(line, "script", raw);
+
+    if (!hasLine && !hasScript) {
+      sendErr(id, subsystem, route, "missing_value", "favSave requires \"line\" or \"script\"");
+      return;
+    }
+
+    String script = unescapeScript(raw);
+    script.trim();
+    if (!script.length()) { sendErr(id, subsystem, route, "empty_script", "Provided line/script is empty"); return; }
+    if (script.length() > FAV_SCRIPT_MAX) { sendErr(id, subsystem, route, "too_long", "Script too long"); return; }
+
+    // safety check on stored lines
+    // check each line for disallowed commands
+    String check = script;
+    int start = 0;
+    while (start < (int)check.length()) {
+      int end = check.indexOf('\n', start);
+      if (end < 0) end = check.length();
+      String one = check.substring(start, end);
+      one.trim();
+      start = end + 1;
+      if (!one.length()) continue;
+      if (looksDangerousFavorite(one)) {
+        sendErr(id, subsystem, route, "disallowed", "Favorite cannot include persist/factoryReset/favRun");
+        return;
+      }
+    }
+
+    cmdFavValid[idx] = true;
+    cmdFavScript[idx] = script;
+    cfgDirty = true;
+    sendOk(id, subsystem, route, "fav_saved");
+    sendState("done", id, subsystem, route);
+    return;
+  }
+
+  if (cmd == "favrun") {
+    int slot=0;
+    if (!getIntField(line, "slot", slot) || slot < 1 || slot > CMD_FAV_SLOTS) { sendErr(id, subsystem, route, "bad_slot", "favRun requires slot 1..5"); return; }
+    int idx = slot - 1;
+    if (!cmdFavValid[idx] || !cmdFavScript[idx].length()) { sendErr(id, subsystem, route, "empty_slot", "favorite slot is empty"); return; }
+
+    sendOk(id, subsystem, route, "macro_running");
+    bool ok = runFavoriteScript(id, subsystem, route, cmdFavScript[idx]);
+    if (ok) {
+      sendOk(id, subsystem, route, "macro_complete");
+      sendState("done", id, subsystem, route);
+    }
+    return;
+  }
+
   // ---- sweep macro ----
   if (cmd == "sweep") {
     String axis="x"; (void)getStringField(line, "axis", axis);
@@ -965,7 +1453,6 @@ static void handleCommandLine(String line) {
       sendErr(id, subsystem, route, "bad_dur", "sweep dur must be 0<dur<=3600 seconds");
       return;
     }
-    bool total=false; (void)getBoolField(line, "total", total);
 
     int loops=1; (void)getIntField(line, "loops", loops);
     if (loops < 0) loops = 0;
@@ -975,18 +1462,16 @@ static void handleCommandLine(String line) {
     if (dwellSec < 0.0f) dwellSec = 0.0f;
     if (dwellSec > 60.0f) dwellSec = 60.0f;
 
-    // Enqueue decision: sweep is inherently multi-step; we always enqueue.
-    (void)shouldEnqueue(qMode, hasQ, qVal);
-
-    float legSec = total ? (durSec * 0.5f) : durSec;
-    uint32_t legMs = (uint32_t)(legSec * 1000.0f + 0.5f);
+    // Always enqueues; if you want it immediate, set queue mode off and q:false then use set/adjust loops yourself.
+    uint32_t legMs = (uint32_t)(durSec * 1000.0f + 0.5f);
     uint32_t dwellMs = (uint32_t)(dwellSec * 1000.0f + 0.5f);
 
     int cycles = loops;
-    if (cycles == 0) cycles = 1000; // big chunk; stopAll breaks it
+    if (cycles == 0) cycles = 1000; // chunk; stopAll/qAbort stops it
 
+    // Estimate queue need: move-to-from + (to+from)*cycles + optional dwells
     int baseSteps = 1 + cycles * 2;
-    int dwellSteps = (dwellMs > 0) ? baseSteps : 0;
+    int dwellSteps = (dwellMs > 0) ? (1 + cycles * 2) : 0;
     int totalSteps = baseSteps + dwellSteps;
     if (totalSteps > (int)QMAX - (int)qCount) { sendErr(id, subsystem, route, "queue_full", "Not enough queue space for sweep steps"); return; }
 
@@ -995,24 +1480,19 @@ static void handleCommandLine(String line) {
     float toX   = useX ? to   : v1;
     float toY   = useY ? to   : v2;
 
-    float sp=-1; bool hasSpeed2 = getNumberField(line, "speed", sp);
-    float useSp = (hasSpeed2 && sp > 0.1f) ? sp : defaultSpeed;
-
-    uint32_t ref = id;
-
-    // Move to FROM (speed-derived)
+    // Move to FROM first (speed-derived)
     QueueItem moveToFrom;
-    moveToFrom.id = ref++; moveToFrom.subsystem=subsystem; moveToFrom.route=route;
+    moveToFrom.id = id; moveToFrom.subsystem=subsystem; moveToFrom.route=route;
     moveToFrom.kind="sweepToFrom"; moveToFrom.useX=useX; moveToFrom.useY=useY;
     moveToFrom.tx=fromX; moveToFrom.ty=fromY;
-    moveToFrom.dx = useX ? durationFromSpeed(v1, fromX, useSp) : 0;
-    moveToFrom.dy = useY ? durationFromSpeed(v2, fromY, useSp) : 0;
+    moveToFrom.dx = useX ? durationFromSpeed(v1, fromX, defaultSpeed) : 0;
+    moveToFrom.dy = useY ? durationFromSpeed(v2, fromY, defaultSpeed) : 0;
     if (!qEnqueue(moveToFrom)) { sendErr(id, subsystem, route, "queue_full", "Queue full"); return; }
 
     auto enqueueHold = [&](float hx, float hy) -> bool {
       if (dwellMs == 0) return true;
       QueueItem hold;
-      hold.id = ref++; hold.subsystem=subsystem; hold.route=route;
+      hold.id = ++autoId; hold.subsystem=subsystem; hold.route=route;
       hold.kind="dwell"; hold.useX=useX; hold.useY=useY;
       hold.tx=hx; hold.ty=hy;
       hold.dx = useX ? dwellMs : 0;
@@ -1024,7 +1504,7 @@ static void handleCommandLine(String line) {
 
     for (int c=0; c<cycles; c++) {
       QueueItem legTo;
-      legTo.id=ref++; legTo.subsystem=subsystem; legTo.route=route;
+      legTo.id=++autoId; legTo.subsystem=subsystem; legTo.route=route;
       legTo.kind="sweepTo"; legTo.useX=useX; legTo.useY=useY;
       legTo.tx=toX; legTo.ty=toY;
       legTo.dx = useX ? legMs : 0;
@@ -1033,7 +1513,7 @@ static void handleCommandLine(String line) {
       if (!enqueueHold(toX, toY)) { sendErr(id, subsystem, route, "queue_full", "Queue full"); return; }
 
       QueueItem legFrom;
-      legFrom.id=ref++; legFrom.subsystem=subsystem; legFrom.route=route;
+      legFrom.id=++autoId; legFrom.subsystem=subsystem; legFrom.route=route;
       legFrom.kind="sweepFrom"; legFrom.useX=useX; legFrom.useY=useY;
       legFrom.tx=fromX; legFrom.ty=fromY;
       legFrom.dx = useX ? legMs : 0;
@@ -1047,7 +1527,7 @@ static void handleCommandLine(String line) {
     return;
   }
 
-  // ---- motion commands (set/adjust/center) ----
+  // ---- motion commands ----
   if (cmd == "set" || cmd == "adjust" || cmd == "center") {
     String axis="xy"; (void)getStringField(line, "axis", axis);
     bool ok=false; String ec, em;
@@ -1083,19 +1563,24 @@ void setup() {
   s1.attach(SERVO1_PIN, 500, 2400);
   s2.attach(SERVO2_PIN, 500, 2400);
 
+  applyDefaults();
+  bool loaded = loadConfigFromFlash();
+
   applyOutputs();
 
   Serial.println();
-  Serial.println("Servo controller ready (JSONL).");
-  Serial.println("IMPORTANT: commands must be JSON objects containing \"cmd\".");
-  Serial.println("Try one of these:");
+  Serial.println("PanTilt_JSON ready (JSONL over Serial).");
+  Serial.println("Commands must be JSON objects containing \"cmd\" and end with newline.");
+  Serial.println("Try:");
   Serial.println("  {\"cmd\":\"commands\"}");
   Serial.println("  {\"cmd\":\"help\"}");
   Serial.println("  {\"cmd\":\"examples\"}");
-  Serial.println("  {\"cmd\":\"speed\",\"value\":90}");
+  Serial.println("  {\"cmd\":\"status\"}");
   Serial.println();
+  Serial.print("Config loaded from flash: ");
+  Serial.println(loaded ? "true" : "false");
   Serial.println("Queue mode default: step (enqueue only when \"q\":true).");
-  Serial.println("Example no-id move: {\"cmd\":\"center\",\"axis\":\"xy\",\"dur\":1.0}");
+  Serial.println("Reminder: persist writes config to flash only when you call it.");
 }
 
 void loop() {
@@ -1120,4 +1605,3 @@ void loop() {
     }
   }
 }
-
